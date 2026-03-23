@@ -1,0 +1,24 @@
+# vision_params.yaml
+# Parameters for all ur5e_vision nodes.
+# Load with: ros2 run ur5e_vision <node> --ros-args --params-file <path>/vision_params.yaml
+
+object_localizer:
+  ros__parameters:
+    model_path: best.pt   # path to YOLO weights (absolute or relative to working directory)
+    confidence_threshold: 0.5        # lower = more detections, higher = fewer false positives
+    target_class: 'angle grinder housing'  # only this class drives robot motion; '' = any class
+    base_frame: base_link            # robot base frame (target for 3D pose output)
+    depth_scale: 0.001               # RealSense default: 16-bit counts in mm → metres (0.001)
+
+    # RealSense topic names (with default realsense2_camera namespace 'camera')
+    color_topic:       /camera/camera/color/image_raw
+    depth_topic:       /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+
+llm_planner:
+  ros__parameters:
+    api_key: ollama                  # ollama ignores the key; any non-empty string works
+    model: qwen2.5vl:7b              # ollama model name — change to qwen2.5vl:72b for best quality
+    base_url: http://REPLACE_WITH_RTX_PC_IP:11434/v1   # ← put your RTX PC's LAN IP here
+    max_steps: 20                    # safety limit: stop after this many LLM iterations
+    move_speed: 0.15                 # MoveIt2 velocity scaling factor (0–1); keep low

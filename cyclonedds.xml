@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <!-- Allow messages up to 10 MB (needed for uncompressed 640x480 images ~900 KB) -->
+            <MaxMessageSize>10MB</MaxMessageSize>
+            <!-- Fragment size must stay under UDP MTU (65507 B for loopback) -->
+            <FragmentSize>63000B</FragmentSize>
+        </General>
+        <Internal>
+            <!-- Increase socket send/receive buffers to handle image data -->
+            <SocketReceiveBufferSize min="10MB"/>
+            <SocketSendBufferSize    min="10MB"/>
+            <!-- Larger receive queue for image bursts -->
+            <MaxQueuedRexmitBytes>10MB</MaxQueuedRexmitBytes>
+        </Internal>
+        <Discovery>
+            <MaxAutoParticipantIndex>100</MaxAutoParticipantIndex>
+        </Discovery>
+    </Domain>
+</CycloneDDS>
