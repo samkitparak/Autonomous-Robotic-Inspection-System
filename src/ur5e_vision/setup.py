@@ -23,10 +23,11 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'object_localizer    = ur5e_vision.object_localizer:main',
-            'llm_planner         = ur5e_vision.llm_planner:main',
-            'realsense_publisher = ur5e_vision.realsense_publisher:main',
-            'data_collector      = ur5e_vision.data_collector:main',
+            'object_localizer       = ur5e_vision.object_localizer:main',
+            'llm_planner            = ur5e_vision.llm_planner:main',
+            'realsense_publisher    = ur5e_vision.realsense_publisher:main',
+            'data_collector         = ur5e_vision.data_collector:main',
+            'inspection_dashboard   = ur5e_vision.inspection_dashboard:main',
         ],
     },
 )
