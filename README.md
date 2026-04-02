@@ -59,15 +59,19 @@ Run with: `python scripts/<script>.py`
 
 ```bash
 # Terminal 1 — Hardware bringup
+source ~/ur5_ws/fast_setup.sh
 ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=<IP> use_fake_hardware:=false
 
 # Terminal 2 — MoveIt2
+source ~/ur5_ws/fast_setup.sh
 ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e
 
 # Terminal 3 — Scanning node
+source ~/ur5_ws/fast_setup.sh
 ros2 run ur5e_scanning scanning_node
 
 # Or vision pipeline
+source ~/ur5_ws/fast_setup.sh
 ros2 launch ur5e_vision camera_transform.launch.py
 ros2 run ur5e_vision object_localizer
 ros2 run ur5e_vision llm_planner
