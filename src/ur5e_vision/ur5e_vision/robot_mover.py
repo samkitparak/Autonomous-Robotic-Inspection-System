@@ -12,6 +12,7 @@ Requires: MoveIt2 running with /move_action server and /compute_ik service.
 
 import math
 import threading
+import time as _time
 
 import rclpy
 import rclpy.time
@@ -20,17 +21,20 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 
 import tf2_ros
-from geometry_msgs.msg import PoseStamped, Quaternion
+from geometry_msgs.msg import Pose, PoseStamped, Quaternion
 from sensor_msgs.msg import JointState
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
+    CollisionObject,
     Constraints,
     JointConstraint,
     MoveItErrorCodes,
     MotionPlanRequest,
     PlanningOptions,
+    PlanningScene,
 )
 from moveit_msgs.srv import GetPositionIK
+from shape_msgs.msg import SolidPrimitive
 from trajectory_msgs.msg import JointTrajectory
 
 from ur5e_vision.viewpoint_generator import Viewpoint
@@ -43,8 +47,7 @@ class RobotMover:
     Strategy:
       1. Call /compute_ik with the current joint state as seed to get the
          IK solution closest to the current configuration (prevents wrap-around).
-      2. Plan in joint space to that specific configuration (no pose-based IK
-         inside OMPL, so no wrap-around possible at planning time either).
+      2. Plan in joint space to that specific configuration.
       3. Publish the planned trajectory directly to the UR controller topic
          (bypasses MoveIt2's execute layer which mangles timestamps).
     """
@@ -53,30 +56,41 @@ class RobotMover:
     EE_LINK        = 'tool0'
     BASE_FRAME     = 'base_link'
 
-    # UR5e joint names (same order as /joint_states)
     ARM_JOINTS = [
         'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
         'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
     ]
 
+    # Safe "ready" pose — arm upright, tool pointing sideways, clear of workspace.
+    # Standard UR "home" configuration. Adjust if mounting geometry requires it.
+    HOME_JOINT_POSITIONS = {
+        'shoulder_pan_joint':  0.0,
+        'shoulder_lift_joint': -math.pi / 2,   # -90°
+        'elbow_joint':          math.pi / 2,   # +90°
+        'wrist_1_joint':       -math.pi / 2,   # -90°
+        'wrist_2_joint':       -math.pi / 2,   # -90°
+        'wrist_3_joint':        0.0,
+    }
+
     def __init__(self, node: Node, speed: float = 0.15):
         self.node  = node
         self.speed = speed
 
-        self._client   = ActionClient(node, MoveGroup, '/move_action')
+        self._client    = ActionClient(node, MoveGroup, '/move_action')
         self._ik_client = node.create_client(GetPositionIK, '/compute_ik')
 
         # Publish planned trajectories directly to the UR controller topic.
-        # This bypasses MoveIt2's execution layer (which mangles timestamps)
-        # and is the same approach used in sanity.py for this robot.
         self._traj_pub = node.create_publisher(
             JointTrajectory,
             '/scaled_joint_trajectory_controller/joint_trajectory', 10)
 
+        # Publish collision objects to the MoveIt2 planning scene.
+        self._scene_pub = node.create_publisher(
+            PlanningScene, '/planning_scene', 10)
+
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, node)
 
-        # Track current joint state so we can seed MoveIt2 planning correctly.
         self._joint_state      = None
         self._joint_state_lock = threading.Lock()
         node.create_subscription(
@@ -95,11 +109,48 @@ class RobotMover:
     # Public interface
     # ------------------------------------------------------------------
 
+    def move_to_home(self) -> tuple[bool, str]:
+        """Move to the safe home joint configuration before/after inspection."""
+        self.node.get_logger().info('Moving to home position...')
+        return self._send_joint_config_goal(self.HOME_JOINT_POSITIONS)
+
+    def add_table_collision(self, table_z: float = 0.1,
+                            thickness: float = 0.05) -> None:
+        """
+        Add a flat work-surface collision box to the MoveIt2 planning scene.
+
+        table_z   : z-coordinate of the table TOP surface in base_link frame.
+                    Measure this with a ruler from the robot base to the work
+                    surface and pass it via the 'table_z' launch argument.
+        thickness : box depth below the top surface (default 5 cm).
+        """
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [3.0, 3.0, thickness]   # 3 m × 3 m covers full workspace
+
+        pose = Pose()
+        pose.position.z = table_z - thickness / 2.0   # centre at half-thickness below top
+        pose.orientation.w = 1.0
+
+        obj = CollisionObject()
+        obj.id = 'work_table'
+        obj.header.frame_id = self.BASE_FRAME
+        obj.operation = CollisionObject.ADD
+        obj.primitives = [box]
+        obj.primitive_poses = [pose]
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.world.collision_objects = [obj]
+        self._scene_pub.publish(scene)
+
+        self.node.get_logger().info(
+            f'Table collision added: top face at z={table_z:.3f} m in {self.BASE_FRAME}')
+
     def move_to_pose(self, x: float, y: float, z: float) -> tuple[bool, str]:
         """
-        Move the end-effector to (x, y, z) in base_link frame.
-        The current orientation is preserved (robot keeps how it is tilted).
-        Returns (success, human-readable message).
+        Move the end-effector to (x, y, z) in base_link, preserving orientation.
+        Returns (success, message).
         """
         try:
             tf = self.tf_buffer.lookup_transform(
@@ -121,8 +172,7 @@ class RobotMover:
 
     def move_to_viewpoint(self, vp: Viewpoint) -> tuple[bool, str]:
         """
-        Move to a Viewpoint with its computed orientation (pointing down + yaw).
-        Used by the scan_orbit executor so each waypoint has the correct heading.
+        Move to a Viewpoint — position + aim-at orientation.
         """
         qx, qy, qz, qw = vp.to_quaternion_xyzw()
 
@@ -142,12 +192,11 @@ class RobotMover:
         on_waypoint_reached=None,
     ) -> tuple[int, int]:
         """
-        Execute a list of Viewpoints in sequence, each via MoveIt2.
+        Execute a list of Viewpoints in sequence via MoveIt2.
 
         Args:
             viewpoints          : ordered list from viewpoint_generator
-            on_waypoint_reached : optional callable(index, viewpoint) called
-                                  after each successful move (e.g. to capture image)
+            on_waypoint_reached : optional callable(index, viewpoint) after each success
         Returns:
             (num_succeeded, num_total)
         """
@@ -155,7 +204,7 @@ class RobotMover:
         for i, vp in enumerate(viewpoints):
             self.node.get_logger().info(
                 f'Orbit waypoint {i + 1}/{len(viewpoints)}: '
-                f'({vp.x:.3f}, {vp.y:.3f}, {vp.z:.3f})  yaw={math.degrees(vp.yaw):.0f}°')
+                f'({vp.x:.3f}, {vp.y:.3f}, {vp.z:.3f})')
 
             ok, msg = self.move_to_viewpoint(vp)
             if ok:
@@ -169,10 +218,7 @@ class RobotMover:
         return succeeded, len(viewpoints)
 
     def get_current_ee_pose(self) -> dict | None:
-        """
-        Returns current end-effector position as {'x', 'y', 'z'} in base frame.
-        Returns None if TF is unavailable.
-        """
+        """Returns current EE position as {'x', 'y', 'z'} in base frame."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.BASE_FRAME, self.EE_LINK,
@@ -195,20 +241,13 @@ class RobotMover:
     def _send_pose_goal(self, target: PoseStamped) -> tuple[bool, str]:
         """
         Plan and execute a move to the given target pose.
-
-        Two-step process:
-          1. /compute_ik with current joints as seed → nearby IK solution
-          2. Joint-space plan from current → IK solution (no wrap-around)
+        Step 1: /compute_ik seeded with current joints → nearby joint config.
+        Step 2: joint-space plan + execute to that config.
         """
         with self._joint_state_lock:
             js = self._joint_state
 
-        # ----------------------------------------------------------------
-        # Step 1: Compute IK seeded with current joint state
-        # ----------------------------------------------------------------
-        # Seeding with the current state forces KDL/TRAC-IK to return the
-        # solution closest to where the robot already is, instead of a
-        # wrap-around solution (e.g. shoulder_pan going -330° instead of +30°).
+        # Step 1 — IK seeded with current state
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.group_name       = self.PLANNING_GROUP
         ik_req.ik_request.avoid_collisions = True
@@ -226,26 +265,40 @@ class RobotMover:
                         if isinstance(v, int)}
             return False, f'IK failed: {code_map.get(ik_code, str(ik_code))}'
 
-        goal_js = ik_result.solution.joint_state  # nearby joint configuration
+        goal_js = ik_result.solution.joint_state
 
-        # Log and sanity-check the IK solution
+        # Sanity check: reject solutions that still require a large joint wrap
         if js is not None:
             cur  = dict(zip(js.name,      js.position))
             goal = dict(zip(goal_js.name, goal_js.position))
-            deltas = {n: abs(cur.get(n, 0) - goal.get(n, 0)) for n in self.ARM_JOINTS}
+            deltas   = {n: abs(cur.get(n, 0) - goal.get(n, 0)) for n in self.ARM_JOINTS}
             max_delta = max(deltas.values())
             self.node.get_logger().info(
-                f'IK solution: max_delta={max_delta:.3f} rad  '
+                f'IK: max_delta={max_delta:.3f} rad  '
                 f'pan: {cur.get("shoulder_pan_joint", 0):.3f}'
                 f'→{goal.get("shoulder_pan_joint", 0):.3f}')
             if max_delta > math.pi:
                 return False, (
-                    f'IK solution still wraps around ({max_delta:.2f} rad on '
+                    f'IK solution wraps around ({max_delta:.2f} rad on '
                     f'{max(deltas, key=deltas.get)}) — target may be unreachable nearby')
 
-        # ----------------------------------------------------------------
-        # Step 2: Joint-space motion plan to the IK solution
-        # ----------------------------------------------------------------
+        goal_positions = dict(zip(goal_js.name, goal_js.position))
+        return self._plan_and_execute_joint_config(goal_positions)
+
+    def _send_joint_config_goal(self, joint_positions: dict) -> tuple[bool, str]:
+        """Plan and execute a move directly to the given joint configuration."""
+        return self._plan_and_execute_joint_config(joint_positions)
+
+    def _plan_and_execute_joint_config(
+        self, goal_positions: dict
+    ) -> tuple[bool, str]:
+        """
+        Build a joint-space MotionPlanRequest, send to MoveGroup, execute result.
+        Shared by both _send_pose_goal (after IK) and _send_joint_config_goal.
+        """
+        with self._joint_state_lock:
+            js = self._joint_state
+
         req = MotionPlanRequest()
         req.group_name                      = self.PLANNING_GROUP
         req.num_planning_attempts           = 5
@@ -258,10 +311,8 @@ class RobotMover:
         else:
             req.start_state.is_diff = True
 
-        # Goal: the specific joint configuration returned by IK (tolerance ±1°)
-        goal_positions = dict(zip(goal_js.name, goal_js.position))
+        tol   = math.radians(1.0)
         goal_c = Constraints()
-        tol    = math.radians(1.0)
         for name in self.ARM_JOINTS:
             if name not in goal_positions:
                 continue
@@ -274,7 +325,6 @@ class RobotMover:
             goal_c.joint_constraints.append(jc)
         req.goal_constraints = [goal_c]
 
-        # ---- Plan only ----
         plan_goal = MoveGroup.Goal()
         plan_goal.request          = req
         plan_goal.planning_options = PlanningOptions(plan_only=True)
@@ -296,7 +346,6 @@ class RobotMover:
         duration = (traj.points[-1].time_from_start.sec
                     + traj.points[-1].time_from_start.nanosec / 1e9)
 
-        # Diagnostic: log first few waypoints to confirm sensible timing
         def _t(pt):
             return pt.time_from_start.sec + pt.time_from_start.nanosec / 1e9
 
@@ -318,7 +367,8 @@ class RobotMover:
         if js_now is not None:
             cur = dict(zip(js_now.name, js_now.position))
             pt0 = dict(zip(traj.joint_names, traj.points[0].positions))
-            max_err = max(abs(cur.get(j, 0) - pt0.get(j, 0)) for j in traj.joint_names)
+            max_err = max(abs(cur.get(j, 0) - pt0.get(j, 0))
+                          for j in traj.joint_names)
             self.node.get_logger().info(
                 f'Start-state check: max error = {max_err:.4f} rad')
             if max_err > 0.15:
@@ -326,17 +376,12 @@ class RobotMover:
                     f'Trajectory start mismatch ({max_err:.3f} rad) — aborting.')
                 return False, f'Start-state mismatch ({max_err:.3f} rad)'
 
-        # ---- Execute: publish directly to the controller topic ----
-        # stamp=0 → "start executing from now" (ROS convention)
         traj.header.stamp.sec     = 0
         traj.header.stamp.nanosec = 0
         self._traj_pub.publish(traj)
 
-        # ---- Wait for completion via joint-state monitoring ----
-        import time as _time
+        # Wait for completion via joint-state monitoring
         goal_joints = dict(zip(traj.joint_names, traj.points[-1].positions))
-        # 0.15 rad tolerance (~8.6°): UR controller stops slightly before goal
-        # due to velocity scaling.  Extra 8s buffer covers slow final approach.
         deadline = _time.monotonic() + duration + 8.0
         while _time.monotonic() < deadline:
             _time.sleep(0.05)
@@ -368,12 +413,7 @@ class RobotMover:
         return result_box[0]
 
     def _call_action_sync(self, goal, timeout_sec: float = 30.0):
-        """
-        Send an action goal and block until completion.
-        Safe to call from a background thread with MultiThreadedExecutor:
-        the executor processes callbacks in its own threads; we just wait
-        on a threading.Event.
-        """
+        """Send an action goal and block until completion (background-thread safe)."""
         result_box = [None]
         done       = threading.Event()
 

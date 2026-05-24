@@ -28,6 +28,7 @@ setup(
             'realsense_publisher    = ur5e_vision.realsense_publisher:main',
             'data_collector         = ur5e_vision.data_collector:main',
             'inspection_dashboard   = ur5e_vision.inspection_dashboard:main',
+            'workspace_calibrator   = ur5e_vision.workspace_calibrator:main',
         ],
     },
 )

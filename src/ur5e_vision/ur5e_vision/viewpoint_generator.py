@@ -2,36 +2,60 @@
 viewpoint_generator.py
 ----------------------
 Pure geometry — no ROS2 imports.  Generates end-effector waypoints for
-orbiting around a detected object so the offset wrist camera looks at the
+orbiting around a detected object so the centered camera looks at the
 object center from each angle.
 
-Camera geometry (from hardware CAD):
-  - Camera is 17 cm along tool0 +X from the flange
-  - Camera optical axis is 60° from tool0 +Z (straight down) toward tool0 -X
+Camera geometry (centered mount):
+  - Camera is directly below tool0 (no lateral offset)
+  - Camera optical axis = tool0 -Z axis (straight down relative to flange)
 
 Derivation — for the camera to look at the object centre:
-  1. EE yaw = θ  →  tool0 X points AWAY from the object at angle θ
-  2. Camera is then at  EE + 0.17·(cos θ, sin θ, 0)  in world frame
-  3. Camera optical axis in world = (-sin60·cos θ, -sin60·sin θ, -cos60)
-                                   = (-0.866 cos θ, -0.866 sin θ, -0.5)
-  4. For the ray to pass through the object centre, the height must satisfy:
-         h / (r + 0.17) = sin60 / cos60 = tan60/... = 0.5/0.866 = tan(30°) ≈ 0.577
-     so  h_optimal = (r + CAMERA_OFFSET) × tan(30°)
+  1. Place the EE at (obj + r*cos θ, obj + r*sin θ, obj_z + h)
+  2. Compute unit vector d from EE toward object center
+  3. Set tool0 Z axis = d  (camera looks straight at object)
+  4. Set tool0 X axis = orbit tangent, orthogonalized against d
+  5. Derive quaternion from this rotation matrix (Shepperd's method)
 
-Orientation — quaternion for tool0 pointing straight down with yaw ψ:
-  Closed-form:  q = [w=0, x=cos(ψ/2), y=sin(ψ/2), z=0]
-  Verified by:  R(q) = [[cosψ, sinψ, 0], [sinψ, -cosψ, 0], [0, 0, -1]]
-    → tool0-Z = (0,0,-1) (pointing down ✓), tool0-X = (cosψ, sinψ, 0) (at angle ψ ✓)
+  Height formula (30° elevation from horizontal):
+    h = radius × tan(30°) ≈ 0.577 × radius
+  (No camera-offset correction needed — camera is centered.)
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-# Physical camera constants (match camera_transform.launch.py)
-CAMERA_OFFSET_M  = 0.17     # lateral offset from EE (metres)
-CAMERA_PITCH_DEG = 60.0     # degrees from straight-down toward center
 
-_TAN30 = math.tan(math.radians(30))   # ≈ 0.5774 — height/distance ratio
+_TAN30 = math.tan(math.radians(30))   # ≈ 0.5774 — 30° elevation ratio
+
+
+def _mat_to_quat_xyzw(R: list[list[float]]) -> tuple[float, float, float, float]:
+    """3×3 rotation matrix (list of rows) → (qx, qy, qz, qw). Shepperd's method."""
+    trace = R[0][0] + R[1][1] + R[2][2]
+    if trace > 0.0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2][1] - R[1][2]) * s
+        y = (R[0][2] - R[2][0]) * s
+        z = (R[1][0] - R[0][1]) * s
+    elif R[0][0] > R[1][1] and R[0][0] > R[2][2]:
+        s = 2.0 * math.sqrt(1.0 + R[0][0] - R[1][1] - R[2][2])
+        w = (R[2][1] - R[1][2]) / s
+        x = 0.25 * s
+        y = (R[0][1] + R[1][0]) / s
+        z = (R[0][2] + R[2][0]) / s
+    elif R[1][1] > R[2][2]:
+        s = 2.0 * math.sqrt(1.0 + R[1][1] - R[0][0] - R[2][2])
+        w = (R[0][2] - R[2][0]) / s
+        x = (R[0][1] + R[1][0]) / s
+        y = 0.25 * s
+        z = (R[1][2] + R[2][1]) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + R[2][2] - R[0][0] - R[1][1])
+        w = (R[1][0] - R[0][1]) / s
+        x = (R[0][2] + R[2][0]) / s
+        y = (R[1][2] + R[2][1]) / s
+        z = 0.25 * s
+    return (x, y, z, w)
 
 
 @dataclass
@@ -39,24 +63,55 @@ class Viewpoint:
     """
     A single end-effector pose for the scan orbit.
 
-    x, y, z : position in robot base frame (metres)
-    yaw     : tool0 yaw about world Z (radians).
-              At this yaw, tool0 X points away from the object and the camera
-              looks back toward the object center.
+    x, y, z     : EE position in robot base frame (metres)
+    qx, qy, qz, qw : orientation quaternion — tool0 Z axis points toward object center
     """
     x:   float
     y:   float
     z:   float
-    yaw: float   # radians
+    qx:  float = 0.0
+    qy:  float = 0.0
+    qz:  float = 0.0
+    qw:  float = 1.0
 
     def to_quaternion_xyzw(self) -> tuple[float, float, float, float]:
-        """
-        Quaternion for tool0 pointing straight down with self.yaw rotation.
-        Formula: q = [w=0, x=cos(yaw/2), y=sin(yaw/2), z=0]
-        Returns (qx, qy, qz, qw).
-        """
-        half = self.yaw / 2.0
-        return (math.cos(half), math.sin(half), 0.0, 0.0)
+        return (self.qx, self.qy, self.qz, self.qw)
+
+
+def _aim_at_quaternion(
+    ex: float, ey: float, ez: float,
+    obj_x: float, obj_y: float, obj_z: float,
+    theta: float,
+) -> tuple[float, float, float, float]:
+    """
+    Quaternion that orients tool0 so its Z axis points from (ex,ey,ez) toward
+    (obj_x, obj_y, obj_z).  tool0 X is the orbit tangent at angle theta.
+    Returns (qx, qy, qz, qw).
+    """
+    # tool0 Z: unit vector from EE toward object
+    dx, dy, dz = obj_x - ex, obj_y - ey, obj_z - ez
+    d_len = math.sqrt(dx*dx + dy*dy + dz*dz)
+    zx, zy, zz = dx / d_len, dy / d_len, dz / d_len
+
+    # tool0 X: orbit tangent at theta, then orthogonalized against Z
+    tx, ty, tz = -math.sin(theta), math.cos(theta), 0.0
+    dot = tx*zx + ty*zy + tz*zz
+    tx -= dot * zx;  ty -= dot * zy;  tz -= dot * zz
+    t_len = math.sqrt(tx*tx + ty*ty + tz*tz)
+    xx, xy, xz = tx / t_len, ty / t_len, tz / t_len
+
+    # tool0 Y: Z × X  (right-hand rule)
+    yx = zy*xz - zz*xy
+    yy = zz*xx - zx*xz
+    yz = zx*xy - zy*xx
+
+    # Rotation matrix: columns are tool0 axes expressed in world frame
+    R = [
+        [xx, yx, zx],
+        [xy, yy, zy],
+        [xz, yz, zz],
+    ]
+    return _mat_to_quat_xyzw(R)
 
 
 def generate_orbit(
@@ -66,8 +121,8 @@ def generate_orbit(
     radius:         float = 0.25,
     height:         float | None = None,
     num_points:     int   = 8,
-    start_angle:    float = 0.0,          # radians from world +X axis
-    sweep:          float = 2 * math.pi,  # radians; 2π = full circle
+    start_angle:    float = 0.0,
+    sweep:          float = 2 * math.pi,
 ) -> list[Viewpoint]:
     """
     Generate EE viewpoints for an orbit around (obj_x, obj_y, obj_z).
@@ -76,27 +131,24 @@ def generate_orbit(
         obj_{x,y,z}  : object centre in base frame (metres)
         radius       : horizontal standoff from object centre (metres)
         height       : EE height above obj_z (metres).
-                       None → use optimal value  h = (radius + 0.17) × tan(30°)
-        num_points   : number of waypoints (≥ 2 for a sweep, 1 for a single pose)
+                       None → h = radius × tan(30°)  (30° elevation)
+        num_points   : number of waypoints
         start_angle  : angle of first waypoint from world +X axis (radians)
-        sweep        : angular span of the orbit (radians).
-                       2π = full circle, π = half circle, etc.
+        sweep        : angular span (radians); 2π = full circle
 
     Returns:
-        List of Viewpoint objects, one per waypoint.
+        List of Viewpoint objects with aim-at orientations.
     """
     if height is None:
-        height = (radius + CAMERA_OFFSET_M) * _TAN30   # optimal camera alignment
+        height = radius * _TAN30
 
-    height = max(height, 0.12)   # hard floor: never below 12 cm above object
+    height = max(height, 0.12)
 
     viewpoints: list[Viewpoint] = []
     for i in range(num_points):
-        # Angular step: for full circle divide by num_points (wraps around);
-        # for partial sweep divide by (num_points - 1) so endpoints are included.
         if num_points == 1:
             theta = start_angle
-        elif sweep >= 2 * math.pi - 1e-6:   # full circle
+        elif sweep >= 2 * math.pi - 1e-6:
             theta = start_angle + sweep * i / num_points
         else:
             theta = start_angle + sweep * i / (num_points - 1)
@@ -105,9 +157,45 @@ def generate_orbit(
         ey = obj_y + radius * math.sin(theta)
         ez = obj_z + height
 
-        # EE yaw = theta so tool0 X points radially outward (away from object)
-        viewpoints.append(Viewpoint(x=ex, y=ey, z=ez, yaw=theta))
+        qx, qy, qz, qw = _aim_at_quaternion(ex, ey, ez, obj_x, obj_y, obj_z, theta)
+        viewpoints.append(Viewpoint(x=ex, y=ey, z=ez, qx=qx, qy=qy, qz=qz, qw=qw))
 
+    return viewpoints
+
+
+def generate_tiered_orbit(
+    obj_x:       float,
+    obj_y:       float,
+    obj_z:       float,
+    tiers:       list[tuple[float, int]] | None = None,
+    start_angle: float = 0.0,
+) -> list[Viewpoint]:
+    """
+    Generate a multi-ring orbit for complete multi-angle coverage.
+
+    Each tier is (radius_m, num_points). Height is auto-computed per ring
+    so the camera optical axis always aims at the object centre.
+
+    Default tiers:
+      - Inner  (r=0.20 m, 6 pts) — close-up for label reading
+      - Middle (r=0.28 m, 8 pts) — main inspection ring
+      - Outer  (r=0.35 m, 6 pts) — wide-angle overview
+
+    Total: 20 viewpoints covering the object from every horizontal direction
+    and three effective elevations (camera height scales with radius).
+    """
+    if tiers is None:
+        tiers = [(0.20, 6), (0.28, 8), (0.35, 6)]
+
+    viewpoints: list[Viewpoint] = []
+    for radius, n_pts in tiers:
+        ring = generate_orbit(
+            obj_x, obj_y, obj_z,
+            radius=radius,
+            num_points=n_pts,
+            start_angle=start_angle,
+        )
+        viewpoints.extend(ring)
     return viewpoints
 
 
@@ -121,8 +209,7 @@ def coverage_angles_for_label(
     """
     Return a start_angle for a half-orbit that begins from the current EE
     position (so the robot doesn't waste a move going to a far start point).
-    Useful for calling generate_orbit with sweep=π.
     """
     dx = current_ee_x - obj_x
     dy = current_ee_y - obj_y
-    return math.atan2(dy, dx)   # current EE angle from object
+    return math.atan2(dy, dx)

@@ -5,26 +5,21 @@ Flask web dashboard + ROS2 node for UR5e label inspection.
 
   - Serves a web UI on port 5000
   - Streams live YOLO-annotated video
-  - "Start Inspection" button triggers a pipelined WS inspection loop
+  - "Start Inspection" button triggers a structured inspection sequence
   - Real-time status updates via SSE
   - Displays final label result
 
-Inspection strategy (LLM-in-the-loop via WebSocket):
-  1. Open WebSocket to ws://<llm_server>/ws/decide
-  2. Send current camera frame + context
-  3. When LLM responds with an action, immediately send the next frame AND
-     execute the action on the robot concurrently — inference latency is
-     hidden behind robot move time
-  4. Loop until LLM returns capture_label or label_not_found
-  5. On capture_label: POST current frame to /read-label for final OCR
+Inspection strategy (ArUco-anchored structured orbit):
+  1. CALIBRATING  — wait for /workspace_anchor from workspace_calibrator
+  2. LOCALIZING   — wait for /detected_object/pose from object_localizer
+  3. INSPECTING   — execute multi-ring orbit (generate_tiered_orbit) around the part
+  4. ANALYZING    — POST best captured frame to /read-label for OCR
+  5. DONE
 
 Run: ros2 run ur5e_vision inspection_dashboard
 """
 
-import asyncio
 import base64
-import json
-import math
 import os
 import queue
 import threading
@@ -34,7 +29,6 @@ from enum import Enum, auto
 import cv2
 import rclpy
 import rclpy.executors
-import websockets
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 
@@ -45,6 +39,7 @@ import requests
 from sensor_msgs.msg import Image
 
 from ur5e_vision.robot_mover import RobotMover
+from ur5e_vision.viewpoint_generator import generate_tiered_orbit
 
 
 # ---------------------------------------------------------------------------
@@ -52,10 +47,12 @@ from ur5e_vision.robot_mover import RobotMover
 # ---------------------------------------------------------------------------
 
 class State(Enum):
-    IDLE       = auto()   # ready, waiting for user to press Start
-    INSPECTING = auto()   # orbit + capture in progress
-    ANALYZING  = auto()   # Ollama call in progress
-    DONE       = auto()   # result shown; press Start again to re-run
+    IDLE        = auto()   # ready, waiting for user to press Start
+    CALIBRATING = auto()   # waiting for ArUco workspace anchor
+    LOCALIZING  = auto()   # waiting for YOLO + depth object pose
+    INSPECTING  = auto()   # orbit + capture in progress
+    ANALYZING   = auto()   # read-label call in progress
+    DONE        = auto()   # result shown; press Start again to re-run
 
 
 # ---------------------------------------------------------------------------
@@ -160,14 +157,18 @@ HTML = """<!DOCTYPE html>
     transition: background 0.35s;
   }
 
-  .pill-IDLE       { background: rgba(77,141,245,0.1);  border-color: rgba(77,141,245,0.28);  color: var(--blue);   }
-  .pill-IDLE       .status-dot { background: var(--blue); }
-  .pill-INSPECTING { background: rgba(0,223,160,0.1);   border-color: rgba(0,223,160,0.3);    color: var(--green);  }
-  .pill-INSPECTING .status-dot { background: var(--green);  animation: blink .9s infinite; }
-  .pill-ANALYZING  { background: rgba(169,109,245,0.1); border-color: rgba(169,109,245,0.3);  color: var(--purple); }
-  .pill-ANALYZING  .status-dot { background: var(--purple); animation: blink .6s infinite; }
-  .pill-DONE       { background: rgba(0,223,160,0.1);   border-color: rgba(0,223,160,0.3);    color: var(--green);  }
-  .pill-DONE       .status-dot { background: var(--green); }
+  .pill-IDLE        { background: rgba(77,141,245,0.1);  border-color: rgba(77,141,245,0.28);  color: var(--blue);   }
+  .pill-IDLE        .status-dot { background: var(--blue); }
+  .pill-CALIBRATING { background: rgba(245,192,67,0.1);  border-color: rgba(245,192,67,0.3);   color: var(--amber);  }
+  .pill-CALIBRATING .status-dot { background: var(--amber);  animation: blink .8s infinite; }
+  .pill-LOCALIZING  { background: rgba(245,192,67,0.1);  border-color: rgba(245,192,67,0.3);   color: var(--amber);  }
+  .pill-LOCALIZING  .status-dot { background: var(--amber);  animation: blink 1.1s infinite; }
+  .pill-INSPECTING  { background: rgba(0,223,160,0.1);   border-color: rgba(0,223,160,0.3);    color: var(--green);  }
+  .pill-INSPECTING  .status-dot { background: var(--green);  animation: blink .9s infinite; }
+  .pill-ANALYZING   { background: rgba(169,109,245,0.1); border-color: rgba(169,109,245,0.3);  color: var(--purple); }
+  .pill-ANALYZING   .status-dot { background: var(--purple); animation: blink .6s infinite; }
+  .pill-DONE        { background: rgba(0,223,160,0.1);   border-color: rgba(0,223,160,0.3);    color: var(--green);  }
+  .pill-DONE        .status-dot { background: var(--green); }
 
   @keyframes blink {
     0%,100% { opacity:1; transform:scale(1); }
@@ -407,7 +408,7 @@ HTML = """<!DOCTYPE html>
   const resultBody = document.getElementById('result-body');
   const videoWrap  = document.getElementById('video-wrap');
 
-  const STATE_LABELS = { IDLE:'Idle', INSPECTING:'Inspecting', ANALYZING:'Analyzing', DONE:'Complete' };
+  const STATE_LABELS = { IDLE:'Idle', CALIBRATING:'Calibrating', LOCALIZING:'Localizing', INSPECTING:'Inspecting', ANALYZING:'Analyzing', DONE:'Complete' };
 
   function addLog(text, cls) {
     const now = new Date().toLocaleTimeString('en-GB');
@@ -424,7 +425,7 @@ HTML = """<!DOCTYPE html>
   function setState(s) {
     pill.className = 'status-pill pill-' + s;
     pillLabel.textContent = STATE_LABELS[s] || s;
-    btn.disabled = (s === 'INSPECTING' || s === 'ANALYZING');
+    btn.disabled = (s !== 'IDLE' && s !== 'DONE');
     btn.textContent = (s === 'DONE') ? 'Inspect Again' : 'Start Inspection';
     if (s === 'INSPECTING') {
       videoWrap.classList.add('active');
@@ -468,153 +469,6 @@ HTML = """<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
-# Pipelined WebSocket inspection loop
-# ---------------------------------------------------------------------------
-
-async def inspect_part_ws(
-    task: str,
-    get_frame,          # callable() -> np.ndarray | None
-    mover,              # RobotMover
-    push_status,        # callable(str)
-    ws_url: str,
-    obj_x: float = 0.0,
-    obj_y: float = 0.0,
-    obj_z: float = 0.0,
-    yolo_label: str = 'angle grinder',
-) -> str:
-    """
-    Drive the robot via the LLM /ws/decide WebSocket.
-
-    Pipeline per cycle:
-      receive response N  →  send frame N+1 immediately
-                          →  execute action N on robot  (concurrent with LLM)
-
-    Robot move time ≈ LLM latency, so inference is hidden behind motion.
-
-    Returns 'capture_label' or 'label_not_found'.
-    """
-    loop = asyncio.get_event_loop()
-
-    def _encode(img):
-        _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        return base64.b64encode(buf).decode('utf-8')
-
-    def _get_joint_angles_deg():
-        with mover._joint_state_lock:
-            js = mover._joint_state
-        if js is None:
-            return None
-        js_dict = dict(zip(js.name, js.position))
-        return [round(math.degrees(js_dict.get(j, 0.0)), 2)
-                for j in mover.ARM_JOINTS]
-
-    def _payload(img, scan_deg: float) -> str:
-        payload = {
-            'image_b64':    _encode(img),
-            'yolo_label':   yolo_label,
-            'task':         task,
-            'scan_degrees': float(scan_deg),
-            'object_xyz':   [round(obj_x, 4), round(obj_y, 4), round(obj_z, 4)],
-        }
-        ee = mover.get_current_ee_pose()
-        if ee:
-            payload['ee_xyz'] = [round(ee['x'], 4),
-                                  round(ee['y'], 4),
-                                  round(ee['z'], 4)]
-        joints = _get_joint_angles_deg()
-        if joints:
-            payload['joint_angles_deg'] = joints
-        return json.dumps(payload)
-
-    def _execute(resp: dict):
-        """Blocking: map a /decide response to a RobotMover call."""
-        direction = (resp.get('direction') or '').lower()
-        distance  = float(resp.get('distance_m') or 0.04)
-
-        ee = mover.get_current_ee_pose()
-        if not ee:
-            push_status('EE pose unavailable — skipping move.')
-            return
-
-        dx, dy, dz = 0.0, 0.0, 0.0
-
-        if   direction == 'left':    dy =  distance
-        elif direction == 'right':   dy = -distance
-        elif direction == 'up':      dz =  distance
-        elif direction == 'down':    dz = -distance
-        elif direction in ('closer', 'farther'):
-            # Radial move along the EE→object vector
-            vx  = ee['x'] - obj_x
-            vy  = ee['y'] - obj_y
-            mag = (vx ** 2 + vy ** 2) ** 0.5 or 1e-6
-            sign = -1.0 if direction == 'closer' else 1.0
-            dx  = sign * (vx / mag) * distance
-            dy  = sign * (vy / mag) * distance
-        else:
-            push_status(f"Unknown direction '{direction}' — skipping.")
-            return
-
-        tx = ee['x'] + dx
-        ty = ee['y'] + dy
-        tz = max(ee['z'] + dz, 0.10)   # safety floor
-
-        push_status(
-            f"Move {direction} {distance:.3f} m → ({tx:.3f}, {ty:.3f}, {tz:.3f})")
-        ok, msg = mover.move_to_pose(tx, ty, tz)
-        if not ok:
-            push_status(f'Move failed: {msg}')
-
-    try:
-        async with websockets.connect(ws_url, max_size=16 * 1024 * 1024) as ws:
-            push_status('WS connected — sending first frame…')
-
-            frame = get_frame()
-            if frame is None:
-                push_status('No camera frame — aborting.')
-                return 'label_not_found'
-
-            scan_degrees = 0.0
-            await ws.send(_payload(frame, scan_degrees))
-
-            robot_task = None   # asyncio Future for the in-flight robot move
-
-            while True:
-                # Wait for LLM decision
-                raw  = await ws.recv()
-                resp = json.loads(raw)
-
-                action  = resp.get('action', '')
-                lat     = resp.get('latency_s')
-                conf    = resp.get('confidence')
-                push_status(
-                    f"LLM → {action}  "
-                    f"latency={f'{lat:.2f}s' if lat is not None else '?'}  "
-                    f"conf={conf}")
-
-                # Terminal actions — wait for any in-flight move, then stop
-                if action in ('capture_label', 'label_not_found'):
-                    if robot_task is not None:
-                        await robot_task
-                    return action
-
-                # 1. Send next frame immediately (before robot finishes moving)
-                scan_degrees += float(resp.get('degrees') or 0)
-                frame = get_frame()
-                if frame is not None:
-                    await ws.send(_payload(frame, scan_degrees))
-
-                # 2. Ensure previous move is done, then start this action
-                #    (runs concurrently while LLM processes the new frame)
-                if robot_task is not None:
-                    await robot_task
-                robot_task = loop.run_in_executor(None, _execute, resp)
-
-    except Exception as e:
-        push_status(f'WS error: {e}')
-        return 'label_not_found'
-
-
-# ---------------------------------------------------------------------------
 # Dashboard node
 # ---------------------------------------------------------------------------
 
@@ -627,10 +481,12 @@ class InspectionDashboard(Node):
         self.declare_parameter('llm_server', 'http://172.22.132.20:8001')
         self.declare_parameter('move_speed', 0.15)
         self.declare_parameter('port',       5000)
+        self.declare_parameter('table_z',    0.1)
 
         self.llm_server = self.get_parameter('llm_server').value.rstrip('/')
         speed           = self.get_parameter('move_speed').value
         self.port       = self.get_parameter('port').value
+        self._table_z   = self.get_parameter('table_z').value
 
         # ---- state ----
         self._state      = State.IDLE
@@ -638,10 +494,12 @@ class InspectionDashboard(Node):
 
         self._latest_img  = None        # cv2 BGR
         self._img_lock    = threading.Lock()
-        self._img_event   = threading.Event()
 
-        self._latest_pose = None        # PoseStamped (base frame)
+        self._latest_pose = None        # PoseStamped — angle grinder (base frame)
         self._pose_lock   = threading.Lock()
+
+        self._anchor      = None        # PoseStamped — ArUco workspace anchor
+        self._anchor_lock = threading.Lock()
 
         # SSE: one queue per connected browser tab
         self._sse_queues: list[queue.SimpleQueue] = []
@@ -657,6 +515,9 @@ class InspectionDashboard(Node):
         self.create_subscription(
             PoseStamped, '/detected_object/pose',
             self._pose_cb, 10, callback_group=cb_group)
+        self.create_subscription(
+            PoseStamped, '/workspace_anchor',
+            self._anchor_cb, 10, callback_group=cb_group)
 
         # ---- motion ----
         self.mover = RobotMover(self, speed=speed)
@@ -683,11 +544,14 @@ class InspectionDashboard(Node):
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         with self._img_lock:
             self._latest_img = img
-        self._img_event.set()
 
     def _pose_cb(self, msg: PoseStamped):
         with self._pose_lock:
             self._latest_pose = msg
+
+    def _anchor_cb(self, msg: PoseStamped):
+        with self._anchor_lock:
+            self._anchor = msg
 
     # ------------------------------------------------------------------
     # Flask routes
@@ -738,20 +602,12 @@ class InspectionDashboard(Node):
         @app.route('/start', methods=['POST'])
         def start():
             with self._state_lock:
-                if self._state in (State.INSPECTING, State.ANALYZING):
-                    return {'ok': False,
-                            'error': 'Inspection already in progress'}
-                with self._pose_lock:
-                    pose = self._latest_pose
-                if pose is None:
-                    return {'ok': False,
-                            'error': 'No object detected yet — '
-                                     'wait for YOLO to detect the part'}
-                self._state = State.INSPECTING
+                if self._state not in (State.IDLE, State.DONE):
+                    return {'ok': False, 'error': 'Inspection already in progress'}
+                self._state = State.CALIBRATING
 
-            self._push_state('INSPECTING')
-            threading.Thread(
-                target=self._run_inspection, daemon=True).start()
+            self._push_state('CALIBRATING')
+            threading.Thread(target=self._run_inspection, daemon=True).start()
             return {'ok': True}
 
     def _gen_frames(self):
@@ -792,60 +648,98 @@ class InspectionDashboard(Node):
 
     def _run_inspection(self):
         try:
-            self._push_status('Inspection started.')
+            # ----------------------------------------------------------
+            # 0. Move to home + register table collision object
+            # ----------------------------------------------------------
+            self._push_status('Moving to home position...')
+            ok, msg = self.mover.move_to_home()
+            if not ok:
+                self._push_status(f'Warning: home move failed ({msg}) — continuing.')
 
-            with self._pose_lock:
-                pose = self._latest_pose
+            self.mover.add_table_collision(table_z=self._table_z)
+            self._push_status(
+                f'Table collision registered at z={self._table_z:.3f} m.')
 
+            # ----------------------------------------------------------
+            # 1. Wait for workspace anchor (ArUco)
+            # ----------------------------------------------------------
+            self._push_status('Waiting for workspace anchor (ArUco marker)...')
+            anchor = self._wait_for(self._anchor_lock, lambda: self._anchor, timeout=20.0)
+            if anchor is None:
+                self._push_status(
+                    'Workspace anchor not found. '
+                    'Make sure the ArUco marker is visible to the camera.')
+                self._finish(State.IDLE, 'IDLE')
+                return
+            p = anchor.pose.position
+            self._push_status(f'Anchor confirmed at ({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) m.')
+
+            # ----------------------------------------------------------
+            # 2. Get object localisation (YOLO + depth)
+            # ----------------------------------------------------------
+            self._set_state(State.LOCALIZING)
+            self._push_state('LOCALIZING')
+            self._push_status('Localising part...')
+            pose = self._wait_for(self._pose_lock, lambda: self._latest_pose, timeout=10.0)
+            if pose is None:
+                self._push_status(
+                    'Part not detected — is the angle grinder in the camera view?')
+                self._finish(State.IDLE, 'IDLE')
+                return
             obj_x = pose.pose.position.x
             obj_y = pose.pose.position.y
             obj_z = pose.pose.position.z
-            self._push_status(
-                f'Object at ({obj_x:.3f}, {obj_y:.3f}, {obj_z:.3f}) m.')
+            self._push_status(f'Part at ({obj_x:.3f}, {obj_y:.3f}, {obj_z:.3f}) m.')
 
-            ws_url = (self.llm_server
-                      .replace('http://', 'ws://')
-                      .replace('https://', 'wss://')
-                      + '/ws/decide')
+            # ----------------------------------------------------------
+            # 3. Execute multi-ring inspection orbit
+            # ----------------------------------------------------------
+            self._set_state(State.INSPECTING)
+            self._push_state('INSPECTING')
+            viewpoints = generate_tiered_orbit(obj_x, obj_y, obj_z)
+            self._push_status(f'Starting {len(viewpoints)}-point inspection orbit...')
 
-            def get_frame():
-                with self._img_lock:
-                    img = self._latest_img
-                return img.copy() if img is not None else None
+            best_frame = [None]
 
-            final = asyncio.run(inspect_part_ws(
-                task='find the label on this part',
-                get_frame=get_frame,
-                mover=self.mover,
-                push_status=self._push_status,
-                ws_url=ws_url,
-                obj_x=obj_x,
-                obj_y=obj_y,
-                obj_z=obj_z,
-            ))
+            def on_waypoint(i, vp):
+                frame = self._get_frame()
+                if frame is not None:
+                    best_frame[0] = frame
+                self._push_status(f'Waypoint {i + 1}/{len(viewpoints)} reached.')
 
-            if final == 'capture_label':
-                self._set_state(State.ANALYZING)
-                self._push_state('ANALYZING')
-                self._push_status('Best angle found — reading label…')
-                with self._img_lock:
-                    img = self._latest_img
-                result_text = (self._read_label(img)
-                               if img is not None
-                               else 'Unable to read label — no image.')
-            else:
-                result_text = 'Unable to read label.'
+            n_ok, n_total = self.mover.execute_orbit(viewpoints, on_waypoint)
+            self._push_status(f'Orbit complete: {n_ok}/{n_total} waypoints reached.')
+
+            # ----------------------------------------------------------
+            # 4. Read label from best captured frame
+            # ----------------------------------------------------------
+            self._set_state(State.ANALYZING)
+            self._push_state('ANALYZING')
+            self._push_status('Reading label...')
+
+            frame = best_frame[0]
+            if frame is None:
+                frame = self._get_frame()
+
+            result_text = (self._read_label(frame)
+                           if frame is not None
+                           else 'Unable to read label — no frame captured.')
 
             self._push_event('result', result_text)
             if 'unable' in result_text.lower():
                 self._push_status('Could not read label.')
             else:
                 self._push_status('Label read successfully.')
+
+            self._push_status('Returning to home position...')
+            self.mover.move_to_home()
             self._finish(State.DONE, 'DONE')
 
         except Exception as e:
             self.get_logger().error(f'Inspection error: {e}')
             self._push_status(f'ERROR: {e}')
+            self._push_status('Returning to home position...')
+            self.mover.move_to_home()
             self._finish(State.IDLE, 'IDLE')
 
     def _finish(self, state: State, name: str):
@@ -880,6 +774,22 @@ class InspectionDashboard(Node):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _get_frame(self):
+        with self._img_lock:
+            img = self._latest_img
+        return img.copy() if img is not None else None
+
+    def _wait_for(self, lock, getter, timeout: float):
+        """Poll until getter() returns a non-None value or timeout expires."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with lock:
+                val = getter()
+            if val is not None:
+                return val
+            time.sleep(0.2)
+        return None
 
     def _set_state(self, state: State):
         with self._state_lock:

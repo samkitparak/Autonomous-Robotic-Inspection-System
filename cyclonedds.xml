@@ -10,12 +10,13 @@
             <FragmentSize>63000B</FragmentSize>
         </General>
         <Internal>
-            <!-- Increase socket send/receive buffers to handle image data -->
-            <SocketReceiveBufferSize min="10MB"/>
-            <SocketSendBufferSize    min="10MB"/>
-            <!-- Larger receive queue for image bursts -->
             <MaxQueuedRexmitBytes>10MB</MaxQueuedRexmitBytes>
         </Internal>
+        <Tracing>
+            <!-- suppress ddsi_udp_conn_write ENOBUFS spam; real errors still shown -->
+            <Verbosity>severe</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
         <Discovery>
             <MaxAutoParticipantIndex>100</MaxAutoParticipantIndex>
         </Discovery>
